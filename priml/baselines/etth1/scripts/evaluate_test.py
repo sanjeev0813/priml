@@ -1,15 +1,21 @@
 """Tests that evaluation reports preserve their checkpoint inputs."""
 
 from pathlib import Path
+from typing import cast
 
+import json
 import sys
+
+from configgle.launch import resolve_config
 
 import pytest
 import torch
 
+from priml.baselines.etth1 import experiments
 from priml.baselines.etth1.data_test import fixture_config
 from priml.baselines.etth1.experiments import exp_smoke
 from priml.baselines.etth1.scripts import evaluation as evaluate
+from priml.baselines.etth1.train_step import Etth1TrainLoop
 
 
 @pytest.mark.parametrize("alias", ["direct", "hardlink", "symlink"])
@@ -44,7 +50,7 @@ def test_output_cannot_replace_best_selector(
             output.hardlink_to(selector)
         else:
             output.symlink_to(selector)
-    monkeypatch.setattr(evaluate, "exp000", lambda: cfg)
+    monkeypatch.setattr(experiments, "exp000", lambda: cfg)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -61,6 +67,44 @@ def test_output_cannot_replace_best_selector(
     with pytest.raises(ValueError, match="protected input artifact"):
         evaluate.main()
     assert selector.read_bytes() == before
+
+
+@pytest.mark.parametrize("name", ["exp000", "exp001", "exp004"])
+def test_evaluation_uses_selected_recipe(
+    name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cfg = resolve_config(f"{experiments.__name__}.{name}")
+    assert isinstance(cfg, Etth1TrainLoop.Config)
+    cfg.dataset = fixture_config(tmp_path / "data")
+    cfg.dataset.base_dir = "/"
+    cfg = cfg.copy_tree().finalize()
+    model = cfg.step.model.make()
+    checkpoint = tmp_path / "model.pt"
+    torch.save(
+        {"step": {"model": model.state_dict(), "timer_step": {"global_count": 0}}},
+        f=checkpoint,
+    )
+    expected = evaluate.evaluate(model, batches=cfg.dataset.make().test_dataloader())
+    monkeypatch.setattr(experiments, name, lambda: cfg)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "evaluate",
+            "--experiment",
+            name,
+            "--checkpoint",
+            str(checkpoint),
+        ],
+    )
+    assert evaluate.main() == 0
+    report = cast(dict[str, object], json.loads(capsys.readouterr().out))
+    assert report["experiment"] == name
+    assert report["mse"] == expected["mse"]
+    assert report["mae"] == expected["mae"]
 
 
 if __name__ == "__main__":
